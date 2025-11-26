@@ -10,6 +10,7 @@ use cargo_v5::{
     commands::{
         build::{CargoOpts, build},
         cat::cat,
+        completions::FileCompleter,
         devices::devices,
         dir::dir,
         log::log,
@@ -24,6 +25,8 @@ use cargo_v5::{
 };
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
+#[cfg(feature = "clap")]
+use clap_complete::engine::ArgValueCompleter;
 use flexi_logger::{AdaptiveFormat, FileSpec, LogfileSelector, LoggerHandle};
 #[cfg(feature = "field-control")]
 use vex_v5_serial::connection::serial::{self, SerialConnection, SerialDevice};
@@ -96,9 +99,17 @@ enum Command {
     #[clap(visible_alias = "ls")]
     Dir,
     /// Read a file from flash, then write its contents to stdout.
-    Cat { file: PathBuf },
+    Cat { 
+        /// The file to read from the V5 brain
+        #[cfg_attr(feature = "clap", arg(add = ArgValueCompleter::new(FileCompleter)))]
+        file: PathBuf 
+    },
     /// Erase a file from flash.
-    Rm { file: PathBuf },
+    Rm { 
+        /// The file to erase from the V5 brain
+        #[cfg_attr(feature = "clap", arg(add = ArgValueCompleter::new(FileCompleter)))]
+        file: PathBuf 
+    },
     /// Read event log.
     Log {
         #[arg(long, short, default_value = "1")]

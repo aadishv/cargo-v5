@@ -21,6 +21,18 @@ use tabwriter::TabWriter;
 
 use crate::errors::CliError;
 
+#[derive(Debug, Clone)]
+pub struct FileInfo {
+    pub path: String,
+    pub size: u32,
+    pub load_address: u32,
+    pub vendor: FileVendor,
+    pub extension_type: Option<String>,
+    pub timestamp: Option<String>,
+    pub version: Option<String>,
+    pub crc: u32,
+}
+
 fn vendor_prefix(vid: FileVendor) -> &'static str {
     match vid {
         FileVendor::User => "user/",
@@ -37,9 +49,7 @@ fn vendor_prefix(vid: FileVendor) -> &'static str {
     }
 }
 
-pub async fn dir(connection: &mut SerialConnection) -> Result<(), CliError> {
-    let mut tw = TabWriter::new(io::stdout());
-
+pub async fn get_file_entries(connection: &mut SerialConnection) -> Result<Vec<FileInfo>, CliError> {
     const USEFUL_VIDS: [FileVendor; 11] = [
         FileVendor::User,
         FileVendor::Sys,
@@ -60,14 +70,10 @@ pub async fn dir(connection: &mut SerialConnection) -> Result<(), CliError> {
             1,
             FactoryEnablePacket::new(FactoryEnablePayload::new()),
         )
-        .await
-        .unwrap();
+        .await?;
 
-    write!(
-        &mut tw,
-        "\x1B[1mName\tSize\tLoad Address\tVendor\tType\tTimestamp\tVersion\tCRC32\n\x1B[0m"
-    )
-    .unwrap();
+    let mut entries = Vec::new();
+
     for vid in USEFUL_VIDS {
         let file_count = connection
             .packet_handshake::<GetDirectoryFileCountReplyPacket>(
@@ -93,56 +99,76 @@ pub async fn dir(connection: &mut SerialConnection) -> Result<(), CliError> {
                 .await?
                 .payload
             {
-                writeln!(
-                    &mut tw,
-                    "{}{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}",
-                    vendor_prefix(vid),
-                    entry.file_name,
-                    format_size(entry.size, BINARY),
-                    if entry.load_address == u32::MAX {
-                        "-".to_string()
-                    } else {
-                        format!("{:#x}", entry.load_address)
-                    },
-                    vid,
-                    entry
+                let file_info = FileInfo {
+                    path: format!("{}{}", vendor_prefix(vid), entry.file_name),
+                    size: entry.size,
+                    load_address: entry.load_address,
+                    vendor: vid,
+                    extension_type: entry
                         .metadata
                         .as_ref()
                         .map(|m| match m.extension_type {
-                            ExtensionType::Binary => "binary",
-                            ExtensionType::EncryptedBinary => "encrypted",
-                            ExtensionType::Vm => "vm",
-                        })
-                        .unwrap_or("system"),
-                    entry
+                            ExtensionType::Binary => "binary".to_string(),
+                            ExtensionType::EncryptedBinary => "encrypted".to_string(),
+                            ExtensionType::Vm => "vm".to_string(),
+                        }),
+                    timestamp: entry
                         .metadata
                         .as_ref()
                         .map(|m| Utc
                             .timestamp_millis_opt((J2000_EPOCH as i64 + m.timestamp as i64) * 1000)
                             .unwrap()
                             .format("%Y-%m-%d %H:%M:%S")
-                            .to_string())
-                        .unwrap_or("-".to_string()),
-                    entry
+                            .to_string()),
+                    version: entry
                         .metadata
                         .as_ref()
                         .map(|m| format!(
                             "{}.{}.{}.b{}",
                             m.version.major, m.version.minor, m.version.build, m.version.beta
-                        ))
-                        .unwrap_or("-".to_string()),
-                    if entry.crc == u32::MAX {
-                        "-".to_string()
-                    } else {
-                        format!("{:#x}", entry.crc)
-                    },
-                )
-                .unwrap();
+                        )),
+                    crc: entry.crc,
+                };
+                entries.push(file_info);
             }
         }
     }
 
-    tw.flush().unwrap();
+    Ok(entries)
+}
 
+pub async fn dir(connection: &mut SerialConnection) -> Result<(), CliError> {
+    let mut tw = TabWriter::new(io::stdout());
+    let entries = get_file_entries(connection).await?;
+
+    write!(
+        &mut tw,
+        "\x1B[1mName\tSize\tLoad Address\tVendor\tType\tTimestamp\tVersion\tCRC32\n\x1B[0m"
+    )?;
+
+    for entry in entries {
+        writeln!(
+            &mut tw,
+            "{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}",
+            entry.path,
+            format_size(entry.size, BINARY),
+            if entry.load_address == u32::MAX {
+                "-".to_string()
+            } else {
+                format!("{:#x}", entry.load_address)
+            },
+            entry.vendor,
+            entry.extension_type.unwrap_or_else(|| "system".to_string()),
+            entry.timestamp.unwrap_or_else(|| "-".to_string()),
+            entry.version.unwrap_or_else(|| "-".to_string()),
+            if entry.crc == u32::MAX {
+                "-".to_string()
+            } else {
+                format!("{:#x}", entry.crc)
+            },
+        )?;
+    }
+
+    tw.flush()?;
     Ok(())
 }
