@@ -141,6 +141,10 @@ pub async fn dir(connection: &mut SerialConnection) -> Result<(), CliError> {
     let mut tw = TabWriter::new(io::stdout());
     let entries = get_file_entries(connection).await?;
 
+    // Warm the completions cache
+    let file_paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+    super::completions::write_cache(&file_paths);
+
     write!(
         &mut tw,
         "\x1B[1mName\tSize\tLoad Address\tVendor\tType\tTimestamp\tVersion\tCRC32\n\x1B[0m"

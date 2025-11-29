@@ -4,15 +4,42 @@ use std::ffi::OsStr;
 #[cfg(feature = "clap")]
 use clap_complete::engine::{CompletionCandidate, ValueCompleter};
 
-use crate::errors::CliError;
+const CACHE_PATH: &str = "/tmp/cargo-v5-file-cache.json";
+const CACHE_TTL_SECS: u64 = 600; // 10 minutes
 
-async fn get_file_list() -> Result<Vec<String>, CliError> {
-    let mut connection = crate::connection::open_connection().await.map_err(|e| CliError::SerialError(vex_v5_serial::connection::serial::SerialError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e))))?;
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FileCache {
+    timestamp: u64,
+    files: Vec<String>,
+}
 
-    let entries = crate::commands::dir::get_file_entries(&mut connection).await?;
-    let files = entries.into_iter().map(|entry| entry.path).collect();
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
-    Ok(files)
+fn read_cache() -> Option<Vec<String>> {
+    let content = std::fs::read_to_string(CACHE_PATH).ok()?;
+    let cache: FileCache = serde_json::from_str(&content).ok()?;
+
+    if current_timestamp() - cache.timestamp < CACHE_TTL_SECS {
+        Some(cache.files)
+    } else {
+        None
+    }
+}
+
+/// Writes the file list cache. Called by `cargo v5 ls`.
+pub fn write_cache(files: &[String]) {
+    let cache = FileCache {
+        timestamp: current_timestamp(),
+        files: files.to_vec(),
+    };
+    if let Ok(content) = serde_json::to_string(&cache) {
+        let _ = std::fs::write(CACHE_PATH, content);
+    }
 }
 
 #[cfg(feature = "clap")]
@@ -21,8 +48,9 @@ pub struct FileCompleter;
 #[cfg(feature = "clap")]
 impl ValueCompleter for FileCompleter {
     fn complete(&self, current: &OsStr) -> Vec<CompletionCandidate> {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let files = rt.block_on(get_file_list()).unwrap_or_default();
+        let Some(files) = read_cache() else {
+            return Vec::new();
+        };
 
         let current_str = current.to_string_lossy();
 

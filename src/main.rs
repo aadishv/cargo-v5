@@ -24,7 +24,7 @@ use cargo_v5::{
     self_update::{self, SelfUpdateMode},
 };
 use chrono::Utc;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 #[cfg(feature = "clap")]
 use clap_complete::engine::ArgValueCompleter;
 use flexi_logger::{AdaptiveFormat, FileSpec, LogfileSelector, LoggerHandle};
@@ -99,16 +99,16 @@ enum Command {
     #[clap(visible_alias = "ls")]
     Dir,
     /// Read a file from flash, then write its contents to stdout.
-    Cat { 
+    Cat {
         /// The file to read from the V5 brain
         #[cfg_attr(feature = "clap", arg(add = ArgValueCompleter::new(FileCompleter)))]
-        file: PathBuf 
+        file: PathBuf,
     },
     /// Erase a file from flash.
-    Rm { 
+    Rm {
         /// The file to erase from the V5 brain
         #[cfg_attr(feature = "clap", arg(add = ArgValueCompleter::new(FileCompleter)))]
-        file: PathBuf 
+        file: PathBuf,
     },
     /// Read event log.
     Log {
@@ -140,6 +140,8 @@ struct DownloadOpts {
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
+    clap_complete::env::CompleteEnv::with_factory(|| Cargo::command()).complete();
+
     // Parse CLI arguments
     let Cargo::V5 { command, path } = Cargo::parse();
 
