@@ -1,18 +1,14 @@
-use object::{Object, ObjectSection, ObjectSegment};
-use rustc_version::Channel;
-use std::process::{Stdio, exit};
-use tokio::task::block_in_place;
-
-use cargo_metadata::{
-    Message, PackageId,
-    camino::{Utf8Path, Utf8PathBuf},
-};
+use cargo_metadata::{Message, PackageId};
 use clap::Args;
-use fs_err::tokio as fs;
+use object::{Object, ObjectSection, ObjectSegment};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    process::{Stdio, exit},
+};
+use tokio::{process::Command, task::block_in_place};
 
 use crate::errors::CliError;
-
-pub const TARGET_PATH: &str = "armv7a-vex-v5.json";
 
 /// Common Cargo options to forward.
 #[derive(Args, Debug)]
@@ -30,53 +26,48 @@ pub fn cargo_bin() -> std::ffi::OsString {
     std::env::var_os("CARGO").unwrap_or_else(|| "cargo".to_owned().into())
 }
 
+async fn is_supported_release_channel(cargo_bin: &OsStr) -> bool {
+    let rustc = Command::new(cargo_bin)
+        .arg("--version")
+        .output()
+        .await
+        .unwrap();
+    let rustc = String::from_utf8(rustc.stdout).unwrap();
+    rustc.contains("nightly") || rustc.contains("-dev")
+}
+
 pub struct BuildOutput {
-    pub elf_artifact: Utf8PathBuf,
-    pub bin_artifact: Utf8PathBuf,
+    pub elf_artifact: PathBuf,
+    pub bin_artifact: PathBuf,
     pub package_id: PackageId,
 }
 
-pub async fn build(path: &Utf8Path, opts: CargoOpts) -> miette::Result<Option<BuildOutput>> {
-    let rustc_version_meta =
-        rustc_version::version_meta().map_err(|e| CliError::RustcVersionError(e))?;
-    let target_path = path.join(TARGET_PATH);
-    let mut build_cmd = std::process::Command::new(cargo_bin());
+pub async fn build(path: &Path, opts: CargoOpts) -> Result<Option<BuildOutput>, CliError> {
+    let cargo = cargo_bin();
+
+    if !is_supported_release_channel(&cargo).await {
+        return Err(CliError::UnsupportedReleaseChannel)?;
+    }
+
+    let mut build_cmd = std::process::Command::new(cargo);
     build_cmd
         .current_dir(path)
+        .stdout(Stdio::piped())
         .arg("build")
         .arg("--message-format")
         .arg("json-render-diagnostics");
 
-    if !matches!(rustc_version_meta.channel, Channel::Nightly | Channel::Dev) {
-        eprintln!("ERROR: vexide requires Nightly Rust features, but you're using stable.");
-        eprintln!(" hint: this can be fixed by running `rustup override set nightly`");
-        exit(1);
+    let mut explicit_target_specified = false;
+    for arg in &opts.args {
+        if arg == "--target" || arg.starts_with("--target=") {
+            explicit_target_specified = true;
+            break;
+        }
     }
 
-    if !target_path.exists() {
-        fs::create_dir_all(target_path.parent().unwrap())
-            .await
-            .unwrap();
+    if !explicit_target_specified {
+        build_cmd.arg("--target").arg("armv7a-vex-v5");
     }
-
-    // rustc 1.91.0 made a breaking change to the target spec format.
-    //
-    // NOTE: 1.91.0 nightlies before 2025-08-31 will still break with this check,
-    // however my ass is not about to parse dates to determine that so I don't care.
-    let target = if rustc_version_meta.semver.major >= 1 && rustc_version_meta.semver.minor >= 91 {
-        include_str!("../targets/armv7a-vex-v5.json")
-    } else {
-        include_str!("../targets/armv7a-vex-v5-old.json")
-    };
-
-    fs::write(&target_path, target).await.unwrap();
-
-    build_cmd
-        .arg("--target")
-        .arg(&target_path)
-        .arg("-Zbuild-std=core,alloc,compiler_builtins")
-        .arg("-Zbuild-std-features=compiler-builtins-mem")
-        .stdout(Stdio::piped());
 
     build_cmd.args(opts.args);
 
@@ -88,24 +79,21 @@ pub async fn build(path: &Utf8Path, opts: CargoOpts) -> miette::Result<Option<Bu
             let mut output = None;
 
             for message in Message::parse_stream(reader) {
-                match message? {
-                    Message::CompilerArtifact(artifact) => {
-                        if let Some(elf_artifact_path) = artifact.executable {
-                            let binary = objcopy(&std::fs::read(&elf_artifact_path)?)?;
-                            let binary_path = elf_artifact_path.with_extension("bin");
+                if let Message::CompilerArtifact(artifact) = message? {
+                    if let Some(elf_artifact_path) = artifact.executable {
+                        let binary = objcopy(&std::fs::read(&elf_artifact_path)?)?;
+                        let binary_path = elf_artifact_path.with_extension("bin");
 
-                            // Write the binary to a file.
-                            std::fs::write(&binary_path, binary)?;
-                            println!("     \x1b[1;92mObjcopy\x1b[0m {}", binary_path);
+                        // Write the binary to a file.
+                        std::fs::write(&binary_path, binary)?;
+                        eprintln!("     \x1b[1;92mObjcopy\x1b[0m {binary_path}");
 
-                            output = Some(BuildOutput {
-                                bin_artifact: binary_path,
-                                elf_artifact: elf_artifact_path,
-                                package_id: artifact.package_id,
-                            });
-                        }
+                        output = Some(BuildOutput {
+                            bin_artifact: binary_path.into_std_path_buf(),
+                            elf_artifact: elf_artifact_path.into_std_path_buf(),
+                            package_id: artifact.package_id,
+                        });
                     }
-                    _ => {}
                 }
             }
 

@@ -1,14 +1,14 @@
 use std::{path::PathBuf, str::FromStr};
 
-use tokio::io::{stdout, AsyncWriteExt};
+use tokio::io::{AsyncWriteExt, stdout};
 use vex_v5_serial::{
+    Connection,
     commands::file::DownloadFile,
-    connection::{
-        serial::{SerialConnection, SerialError},
-        Connection,
+    protocol::{
+        FixedString,
+        cdc2::file::{FileTransferTarget, FileVendor},
     },
-    packets::file::{FileTransferTarget, FileVendor},
-    string::FixedString,
+    serial::{SerialConnection, SerialError},
 };
 
 use crate::errors::CliError;
@@ -37,7 +37,7 @@ pub async fn cat(connection: &mut SerialConnection, file: PathBuf) -> Result<(),
     };
 
     let file_name = FixedString::from_str(file.file_name().unwrap_or_default().to_str().unwrap())
-        .map_err(|err| CliError::SerialError(SerialError::EncodeError(err)))?;
+        .map_err(|err| CliError::SerialError(SerialError::FixedStringSizeError(err)))?;
 
     stdout()
         .write_all(
@@ -49,8 +49,8 @@ pub async fn cat(connection: &mut SerialConnection, file: PathBuf) -> Result<(),
                     // the exact size of the file.
                     size: u32::MAX,
                     vendor,
-                    target: Some(FileTransferTarget::Qspi),
-                    load_addr: 0,
+                    target: FileTransferTarget::Qspi,
+                    address: 0,
                     progress_callback: None,
                 })
                 .await?,

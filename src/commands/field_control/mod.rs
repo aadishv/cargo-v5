@@ -5,28 +5,28 @@ use std::{
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use ratatui::{
+    Frame,
     layout::{Constraint, Flex, Layout, Rect},
     style::{Color, Style, Stylize},
     symbols::{self, border::Set},
     widgets::{Block, Borders, Paragraph},
-    Frame,
 };
 use tui_term::{
     vt100,
     widget::{Cursor, PseudoTerminal},
 };
 use vex_v5_serial::{
-    connection::{
-        serial::{SerialConnection, SerialError},
-        Connection,
+    Connection,
+    protocol::{
+        cdc::{ProductType, SystemVersionPacket, SystemVersionReplyPacket},
+        cdc2::controller::{
+            CompetitionControlPacket, CompetitionControlPayload, CompetitionControlReplyPacket,
+            MatchMode, UserDataPacket, UserDataPayload, UserDataReplyPacket,
+        },
     },
-    packets::{
-        controller::{UserFifoPacket, UserFifoPayload, UserFifoReplyPacket},
-        match_mode::{MatchMode, SetMatchModePacket, SetMatchModePayload, SetMatchModeReplyPacket},
-        system::{GetSystemVersionPacket, GetSystemVersionReplyPacket, ProductType},
-    },
+    serial::{SerialConnection, SerialError},
 };
-use widgets::{set_duration_digit, HelpPopup, Mode};
+use widgets::{HelpPopup, Mode, set_duration_digit};
 
 use crate::errors::CliError;
 
@@ -37,31 +37,31 @@ async fn set_match_mode(
     match_mode: MatchMode,
 ) -> Result<(), SerialError> {
     connection
-        .packet_handshake::<SetMatchModeReplyPacket>(
+        .handshake::<CompetitionControlReplyPacket>(
             Duration::from_millis(500),
             10,
-            SetMatchModePacket::new(SetMatchModePayload {
+            CompetitionControlPacket::new(CompetitionControlPayload {
                 match_mode,
                 match_time: 0,
             }),
         )
         .await?
-        .try_into_inner()?;
+        .payload?;
     Ok(())
 }
 
 async fn try_read_terminal(connection: &mut SerialConnection) -> Result<Vec<u8>, CliError> {
     let read = connection
-        .packet_handshake::<UserFifoReplyPacket>(
+        .handshake::<UserDataReplyPacket>(
             Duration::from_millis(100),
             1,
-            UserFifoPacket::new(UserFifoPayload {
+            UserDataPacket::new(UserDataPayload {
                 channel: 1, // stdio channel
                 write: None,
             }),
         )
         .await?
-        .try_into_inner()?;
+        .payload?;
 
     let mut data = Vec::new();
     if let Some(read) = read.data {
@@ -417,13 +417,14 @@ fn handle_countdown(tui_state: &mut TuiState) -> Control {
 
 pub async fn run_field_control_tui(connection: &mut SerialConnection) -> Result<(), CliError> {
     let response = connection
-        .packet_handshake::<GetSystemVersionReplyPacket>(
+        .handshake::<SystemVersionReplyPacket>(
             Duration::from_millis(700),
             5,
-            GetSystemVersionPacket::new(()),
+            SystemVersionPacket::new(()),
         )
-        .await?.payload;
-    if let ProductType::Brain = response.product_type {
+        .await?
+        .payload;
+    if response.product_type != ProductType::Controller {
         return Err(CliError::BrainConnectionSetMatchMode);
     }
 

@@ -1,52 +1,53 @@
 use std::{path::PathBuf, str::FromStr, time::Duration};
 
 use vex_v5_serial::{
-    connection::{
-        serial::{SerialConnection, SerialError},
-        Connection,
+    Connection,
+    protocol::{
+        FixedString,
+        cdc2::file::{
+            FileErasePacket, FileErasePayload, FileEraseReplyPacket, FileExitAction,
+            FileTransferExitPacket, FileTransferExitReplyPacket,
+        },
     },
-    packets::file::{
-        EraseFilePacket, EraseFilePayload, EraseFileReplyPacket, ExitFileTransferPacket,
-        ExitFileTransferReplyPacket, FileExitAction,
-    },
-    string::FixedString,
+    serial::{SerialConnection, SerialError},
 };
 
 use crate::errors::CliError;
 
 use super::cat::vendor_from_prefix;
 
-pub async fn rm(connection: &mut SerialConnection, file: PathBuf) -> Result<(), CliError> {
-    let vendor = vendor_from_prefix(if let Some(parent) = file.parent() {
-        parent.to_str().unwrap()
-    } else {
-        ""
-    });
+pub async fn rm(connection: &mut SerialConnection, files: Vec<PathBuf>) -> Result<(), CliError> {
+    for file in files {
+        let vendor = vendor_from_prefix(if let Some(parent) = file.parent() {
+            parent.to_str().unwrap()
+        } else {
+            ""
+        });
 
-    let file_name = FixedString::from_str(file.file_name().unwrap_or_default().to_str().unwrap())
-        .map_err(|err| CliError::SerialError(SerialError::EncodeError(err)))?;
+        let file_name = FixedString::from_str(file.file_name().unwrap_or_default().to_str().unwrap())
+            .map_err(|err| CliError::SerialError(SerialError::FixedStringSizeError(err)))?;
 
-    connection
-        .packet_handshake::<EraseFileReplyPacket>(
-            Duration::from_millis(500),
-            1,
-            EraseFilePacket::new(EraseFilePayload {
-                vendor,
-                option: 0,
-                file_name,
-            }),
-        )
-        .await?
-        .try_into_inner()?;
+        connection
+            .handshake::<FileEraseReplyPacket>(
+                Duration::from_millis(500),
+                1,
+                FileErasePacket::new(FileErasePayload {
+                    vendor,
+                    reserved: 0,
+                    file_name,
+                }),
+            )
+            .await?
+            .payload?;
 
-    connection
-        .packet_handshake::<ExitFileTransferReplyPacket>(
-            Duration::from_millis(500),
-            1,
-            ExitFileTransferPacket::new(FileExitAction::DoNothing),
-        )
-        .await?
-        .try_into_inner()?;
-
+        connection
+            .handshake::<FileTransferExitReplyPacket>(
+                Duration::from_millis(500),
+                1,
+                FileTransferExitPacket::new(FileExitAction::DoNothing),
+            )
+            .await?
+            .payload?;
+    }
     Ok(())
 }

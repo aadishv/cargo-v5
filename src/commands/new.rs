@@ -1,4 +1,3 @@
-use cargo_metadata::camino::Utf8PathBuf;
 use log::{debug, info, warn};
 use serde_json::Value;
 
@@ -25,11 +24,8 @@ async fn get_current_sha() -> Result<String, CliError> {
         .header("User-Agent", "vexide/cargo-v5")
         .send()
         .await
-        .map_err(|err| CliError::ReqwestError(err))?;
-    let response_text = response
-        .text()
-        .await
-        .map_err(|err| CliError::ReqwestError(err))?;
+        .map_err(CliError::ReqwestError)?;
+    let response_text = response.text().await.map_err(CliError::ReqwestError)?;
     match &serde_json::from_str::<Value>(&response_text).unwrap_or_default()["sha"] {
         Value::String(str) => Ok(str.clone()),
         _ => Err(CliError::MalformedResponse),
@@ -96,7 +92,7 @@ fn baked_in_template() -> Template {
     }
 }
 
-fn unpack_template(template: Vec<u8>, dir: &Utf8PathBuf) -> io::Result<()> {
+fn unpack_template(template: Vec<u8>, dir: &PathBuf) -> io::Result<()> {
     let mut archive: tar::Archive<flate2::read::GzDecoder<&[u8]>> =
         tar::Archive::new(flate2::read::GzDecoder::new(&template[..]));
     for entry in archive.entries()? {
@@ -119,7 +115,7 @@ fn unpack_template(template: Vec<u8>, dir: &Utf8PathBuf) -> io::Result<()> {
 }
 
 pub async fn new(
-    path: Utf8PathBuf,
+    path: PathBuf,
     name: Option<String>,
     download_template: bool,
 ) -> Result<(), CliError> {
@@ -132,7 +128,7 @@ pub async fn new(
     };
 
     if std::fs::read_dir(&dir).is_ok_and(|e| e.count() > 0) {
-        return Err(CliError::ProjectDirFull(dir.into_string()));
+        return Err(CliError::ProjectDirFull(dir));
     }
 
     let name = name
@@ -183,6 +179,6 @@ pub async fn new(
     let manifest = manifest.replace("vexide-template", &name);
     tokio::fs::write(manifest_path, manifest).await?;
 
-    info!("Successfully created new project at {:?}", dir);
+    info!("Successfully created new project at {dir:?}");
     Ok(())
 }

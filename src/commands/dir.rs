@@ -1,22 +1,22 @@
 use chrono::{TimeZone, Utc};
 use std::io::{self, Write};
 use std::time::Duration;
-use vex_v5_serial::packets::factory::{
-    FactoryEnablePacket, FactoryEnablePayload, FactoryEnableReplyPacket,
-};
 
-use vex_v5_serial::packets::file::ExtensionType;
-use vex_v5_serial::timestamp::J2000_EPOCH;
 use vex_v5_serial::{
-    connection::{serial::SerialConnection, Connection},
-    packets::file::{
-        FileVendor, GetDirectoryEntryPacket, GetDirectoryEntryPayload,
-        GetDirectoryEntryReplyPacket, GetDirectoryFileCountPacket, GetDirectoryFileCountPayload,
-        GetDirectoryFileCountReplyPacket,
+    Connection,
+    commands::file::J2000_EPOCH,
+    protocol::cdc2::{
+        factory::{FactoryEnablePacket, FactoryEnableReplyPacket},
+        file::{
+            DirectoryEntryPacket, DirectoryEntryPayload, DirectoryEntryReplyPacket,
+            DirectoryFileCountPacket, DirectoryFileCountPayload, DirectoryFileCountReplyPacket,
+            ExtensionType, FileVendor,
+        },
     },
+    serial::SerialConnection,
 };
 
-use humansize::{format_size, BINARY};
+use humansize::{BINARY, format_size};
 use tabwriter::TabWriter;
 
 use crate::errors::CliError;
@@ -65,10 +65,10 @@ pub async fn get_file_entries(connection: &mut SerialConnection) -> Result<Vec<F
     ];
 
     connection
-        .packet_handshake::<FactoryEnableReplyPacket>(
+        .handshake::<FactoryEnableReplyPacket>(
             Duration::from_millis(500),
             1,
-            FactoryEnablePacket::new(FactoryEnablePayload::new()),
+            FactoryEnablePacket::new(FactoryEnablePacket::MAGIC),
         )
         .await?;
 
@@ -76,61 +76,74 @@ pub async fn get_file_entries(connection: &mut SerialConnection) -> Result<Vec<F
 
     for vid in USEFUL_VIDS {
         let file_count = connection
-            .packet_handshake::<GetDirectoryFileCountReplyPacket>(
+            .handshake::<DirectoryFileCountReplyPacket>(
                 Duration::from_millis(500),
                 1,
-                GetDirectoryFileCountPacket::new(GetDirectoryFileCountPayload {
+                DirectoryFileCountPacket::new(DirectoryFileCountPayload {
                     vendor: vid,
-                    option: 0,
+                    reserved: 0,
                 }),
             )
             .await?;
 
-        for n in 0..file_count.payload {
-            if let Some(entry) = connection
-                .packet_handshake::<GetDirectoryEntryReplyPacket>(
+        for n in 0..file_count.payload? {
+            let entry = connection
+                .handshake::<DirectoryEntryReplyPacket>(
                     Duration::from_millis(500),
                     1,
-                    GetDirectoryEntryPacket::new(GetDirectoryEntryPayload {
+                    DirectoryEntryPacket::new(DirectoryEntryPayload {
                         file_index: n as u8,
-                        unknown: 0,
+                        reserved: 0,
                     }),
                 )
                 .await?
-                .payload
-            {
-                let file_info = FileInfo {
-                    path: format!("{}{}", vendor_prefix(vid), entry.file_name),
-                    size: entry.size,
-                    load_address: entry.load_address,
-                    vendor: vid,
-                    extension_type: entry
-                        .metadata
-                        .as_ref()
-                        .map(|m| match m.extension_type {
-                            ExtensionType::Binary => "binary".to_string(),
-                            ExtensionType::EncryptedBinary => "encrypted".to_string(),
-                            ExtensionType::Vm => "vm".to_string(),
-                        }),
-                    timestamp: entry
-                        .metadata
-                        .as_ref()
-                        .map(|m| Utc
-                            .timestamp_millis_opt((J2000_EPOCH as i64 + m.timestamp as i64) * 1000)
-                            .unwrap()
-                            .format("%Y-%m-%d %H:%M:%S")
-                            .to_string()),
-                    version: entry
-                        .metadata
-                        .as_ref()
-                        .map(|m| format!(
-                            "{}.{}.{}.b{}",
-                            m.version.major, m.version.minor, m.version.build, m.version.beta
-                        )),
-                    crc: entry.crc,
-                };
-                entries.push(file_info);
-            }
+                .payload?;
+
+            writeln!(
+                &mut tw,
+                "{}{}\t{}\t{}\t{:?}\t{}\t{}\t{}\t{}",
+                vendor_prefix(vid),
+                entry.file_name,
+                format_size(entry.size, BINARY),
+                if entry.load_address == u32::MAX {
+                    "-".to_string()
+                } else {
+                    format!("{:#x}", entry.load_address)
+                },
+                vid,
+                entry
+                    .metadata
+                    .as_ref()
+                    .map(|m| match m.extension_type {
+                        ExtensionType::Binary => "binary",
+                        ExtensionType::EncryptedBinary => "encrypted",
+                        ExtensionType::Vm => "vm",
+                    })
+                    .unwrap_or("system"),
+                entry
+                    .metadata
+                    .as_ref()
+                    .map(|m| Utc
+                        .timestamp_millis_opt((J2000_EPOCH as i64 + m.timestamp as i64) * 1000)
+                        .unwrap()
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string())
+                    .unwrap_or("-".to_string()),
+                entry
+                    .metadata
+                    .as_ref()
+                    .map(|m| format!(
+                        "{}.{}.{}.b{}",
+                        m.version.major, m.version.minor, m.version.build, m.version.beta
+                    ))
+                    .unwrap_or("-".to_string()),
+                if entry.crc == u32::MAX {
+                    "-".to_string()
+                } else {
+                    format!("{:#x}", entry.crc)
+                },
+            )
+            .unwrap();
         }
     }
 

@@ -1,48 +1,44 @@
-use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, ValueEnum};
 use flate2::{Compression, GzBuilder};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use inquire::{
-    validator::{ErrorMessage, Validation},
     CustomType,
+    validator::{ErrorMessage, Validation},
 };
-use tokio::{fs::File, io::AsyncWriteExt, spawn, sync::Mutex, task::block_in_place, time::Instant};
+use tokio::{fs::File, io::AsyncWriteExt, sync::Mutex, task::block_in_place, time::Instant};
 
 use std::{
+    ffi::OsStr,
     io::{ErrorKind, Write},
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
 use vex_v5_serial::{
-    commands::file::{
-        LinkedFile, Program, ProgramIniConfig, Project, UploadFile, USER_PROGRAM_LOAD_ADDR,
-    },
-    connection::{
-        serial::{SerialConnection, SerialError},
-        Connection,
-    },
-    crc::VEX_CRC32,
-    packets::{
-        cdc2::Cdc2Ack,
-        file::{
-            ExtensionType, FileExitAction, FileMetadata, FileVendor, GetFileMetadataPacket,
-            GetFileMetadataPayload, GetFileMetadataReplyPacket, GetFileMetadataReplyPayload,
+    Connection,
+    commands::file::{LinkedFile, USER_PROGRAM_LOAD_ADDR, UploadFile, j2000_timestamp},
+    protocol::{
+        FixedString, VEX_CRC32, Version,
+        cdc2::{
+            Cdc2Ack,
+            file::{
+                ExtensionType, FileExitAction, FileMetadata, FileMetadataPacket,
+                FileMetadataPayload, FileMetadataReplyPacket, FileMetadataReplyPayload,
+                FileTransferTarget, FileVendor,
+            },
         },
-        radio::RadioChannel,
     },
-    string::FixedString,
-    timestamp::j2000_timestamp,
-    version::Version,
+    serial::{SerialConnection, SerialError},
 };
 
 use crate::{
-    connection::{open_connection, switch_radio_channel},
+    connection::{open_connection, switch_to_download_channel},
     errors::CliError,
     metadata::Metadata,
 };
 
-use super::build::{build, objcopy, CargoOpts};
+use super::build::{CargoOpts, build, objcopy};
 
 /// Options used to control the behavior of a program upload
 #[derive(Args, Debug)]
@@ -69,7 +65,7 @@ pub struct UploadOpts {
 
     /// An build artifact to upload (either an ELF or BIN).
     #[arg(long)]
-    pub file: Option<Utf8PathBuf>,
+    pub file: Option<PathBuf>,
 
     /// Method to use when uploading binaries.
     #[arg(long)]
@@ -162,7 +158,7 @@ const DIFFERENTIAL_UPLOAD_MAX_SIZE: usize = 0x200000;
 /// Upload a program to the brain.
 pub async fn upload_program(
     connection: &mut SerialConnection,
-    path: &Utf8Path,
+    path: &Path,
     after: AfterUpload,
     slot: u8,
     name: String,
@@ -175,20 +171,24 @@ pub async fn upload_program(
 ) -> Result<(), CliError> {
     let multi_progress = MultiProgress::new();
 
-    let slot_file_name = format!("slot_{}.bin", slot);
-    let ini_file_name = format!("slot_{}.ini", slot);
+    let slot_file_name = format!("slot_{slot}.bin");
+    let ini_file_name = format!("slot_{slot}.ini");
 
-    let ini_data = serde_ini::to_vec(&ProgramIniConfig {
-        program: Program {
-            description,
-            icon: format!("USER{:03}x.bmp", icon as u16),
-            iconalt: String::new(),
-            slot: slot - 1,
-            name,
-        },
-        project: Project { ide: program_type },
-    })
-    .unwrap();
+    let ini = format!(
+        "[project]
+ide={}
+[program]
+name={}
+slot={}
+icon=USER{:03}x.bmp
+iconalt=
+description={}",
+        program_type,
+        name,
+        slot - 1,
+        icon as u16,
+        description
+    );
 
     let needs_ini_upload = if let Some(brain_metadata) = brain_file_metadata(
         connection,
@@ -197,7 +197,7 @@ pub async fn upload_program(
     )
     .await?
     {
-        brain_metadata.crc32 != VEX_CRC32.checksum(&ini_data)
+        brain_metadata.crc32 != VEX_CRC32.checksum(ini.as_bytes())
     } else {
         true
     };
@@ -220,9 +220,9 @@ pub async fn upload_program(
 
         connection
             .execute_command(UploadFile {
-                filename: FixedString::new(ini_file_name).unwrap(),
+                file_name: FixedString::new(ini_file_name).unwrap(),
                 metadata: FileMetadata {
-                    extension: FixedString::new("ini".to_string()).unwrap(),
+                    extension: FixedString::new("ini").unwrap(),
                     extension_type: ExtensionType::default(),
                     timestamp: j2000_timestamp(),
                     version: Version {
@@ -232,10 +232,10 @@ pub async fn upload_program(
                         beta: 0,
                     },
                 },
-                vendor: None,
-                data: ini_data,
-                target: None,
-                load_addr: USER_PROGRAM_LOAD_ADDR,
+                vendor: FileVendor::User,
+                data: ini.as_bytes(),
+                target: FileTransferTarget::Qspi,
+                load_address: USER_PROGRAM_LOAD_ADDR,
                 linked_file: None,
                 after_upload: FileExitAction::DoNothing,
                 progress_callback: Some(build_progress_callback(
@@ -270,9 +270,9 @@ pub async fn upload_program(
             // Upload the program.
             connection
                 .execute_command(UploadFile {
-                    filename: FixedString::new(slot_file_name.clone()).unwrap(),
+                    file_name: FixedString::new(slot_file_name.clone()).unwrap(),
                     metadata: FileMetadata {
-                        extension: FixedString::new("bin".to_string()).unwrap(),
+                        extension: FixedString::new("bin").unwrap(),
                         extension_type: ExtensionType::default(),
                         timestamp: j2000_timestamp(),
                         version: Version {
@@ -282,8 +282,8 @@ pub async fn upload_program(
                             beta: 0,
                         },
                     },
-                    vendor: Some(FileVendor::User),
-                    data: {
+                    vendor: FileVendor::User,
+                    data: &{
                         let mut data = tokio::fs::read(path).await?;
 
                         if compress {
@@ -292,8 +292,8 @@ pub async fn upload_program(
 
                         data
                     },
-                    target: None,
-                    load_addr: USER_PROGRAM_LOAD_ADDR,
+                    target: FileTransferTarget::Qspi,
+                    load_address: USER_PROGRAM_LOAD_ADDR,
                     linked_file: None,
                     after_upload: match after {
                         AfterUpload::None => FileExitAction::DoNothing,
@@ -311,7 +311,7 @@ pub async fn upload_program(
             bin_progress.lock().await.finish();
         }
         UploadStrategy::Differential => {
-            let base_file_name = format!("slot_{}.base.bin", slot);
+            let base_file_name = format!("slot_{slot}.base.bin");
 
             let mut base = match tokio::fs::read(&path.with_file_name(&base_file_name)).await {
                 Ok(contents) => Some(contents),
@@ -320,29 +320,30 @@ pub async fn upload_program(
             };
 
             let needs_cold_upload = cold
-                || if let Some(base) = base.as_mut() {
-                    if let Some(brain_metadata) = brain_file_metadata(
+                || 'check: {
+                    let Some(base) = base.as_mut() else {
+                        break 'check true;
+                    };
+
+                    let Some(brain_metadata) = brain_file_metadata(
                         connection,
                         FixedString::new(base_file_name.clone()).unwrap(),
                         FileVendor::User,
                     )
                     .await?
-                    {
-                        if base.len() >= 4 {
-                            let crc_metadata = u32::from_le_bytes(
-                                base.split_off(base.len() - 4).try_into().unwrap(),
-                            );
+                    else {
+                        break 'check true;
+                    };
 
-                            // last four bytes of base file contain the crc32 at time of upload
-                            brain_metadata.crc32 != crc_metadata
-                        } else {
-                            true
-                        }
+                    if base.len() >= 4 {
+                        let crc_metadata =
+                            u32::from_le_bytes(base.split_off(base.len() - 4).try_into().unwrap());
+
+                        // last four bytes of base file contain the crc32 at time of upload
+                        brain_metadata.crc32 != crc_metadata
                     } else {
                         true
                     }
-                } else {
-                    true
                 };
 
             if !needs_cold_upload {
@@ -379,9 +380,9 @@ pub async fn upload_program(
 
                 connection
                     .execute_command(UploadFile {
-                        filename: FixedString::new(slot_file_name.clone()).unwrap(),
+                        file_name: FixedString::new(slot_file_name.clone()).unwrap(),
                         metadata: FileMetadata {
-                            extension: FixedString::new("bin".to_string()).unwrap(),
+                            extension: FixedString::new("bin").unwrap(),
                             extension_type: ExtensionType::default(),
                             timestamp: j2000_timestamp(),
                             version: Version {
@@ -391,13 +392,13 @@ pub async fn upload_program(
                                 beta: 0,
                             },
                         },
-                        vendor: Some(FileVendor::User),
-                        data: patch,
-                        target: None,
-                        load_addr: 0x07A00000,
+                        vendor: FileVendor::User,
+                        data: &patch,
+                        target: FileTransferTarget::Qspi,
+                        load_address: 0x07A00000,
                         linked_file: Some(LinkedFile {
-                            filename: FixedString::new(base_file_name.clone()).unwrap(),
-                            vendor: Some(FileVendor::User),
+                            file_name: FixedString::new(base_file_name.clone()).unwrap(),
+                            vendor: FileVendor::User,
                         }),
                         after_upload: match after {
                             AfterUpload::None => FileExitAction::DoNothing,
@@ -438,9 +439,9 @@ pub async fn upload_program(
 
                 connection
                     .execute_command(UploadFile {
-                        filename: FixedString::new(base_file_name.clone()).unwrap(),
+                        file_name: FixedString::new(base_file_name.clone()).unwrap(),
                         metadata: FileMetadata {
-                            extension: FixedString::new("bin".to_string()).unwrap(),
+                            extension: FixedString::new("bin").unwrap(),
                             extension_type: ExtensionType::default(),
                             timestamp: j2000_timestamp(),
                             version: Version {
@@ -450,7 +451,7 @@ pub async fn upload_program(
                                 beta: 0,
                             },
                         },
-                        vendor: Some(FileVendor::User),
+                        vendor: FileVendor::User,
                         data: {
                             let mut base_file =
                                 File::create(path.with_file_name(&base_file_name)).await?;
@@ -464,10 +465,10 @@ pub async fn upload_program(
                                 .write_all(&VEX_CRC32.checksum(&base_data).to_le_bytes())
                                 .await?;
 
-                            base_data
+                            &base_data
                         },
-                        target: None,
-                        load_addr: USER_PROGRAM_LOAD_ADDR,
+                        target: FileTransferTarget::Qspi,
+                        load_address: USER_PROGRAM_LOAD_ADDR,
                         linked_file: None,
                         after_upload: FileExitAction::DoNothing,
                         progress_callback: Some(build_progress_callback(
@@ -480,9 +481,9 @@ pub async fn upload_program(
 
                 connection
                     .execute_command(UploadFile {
-                        filename: FixedString::new(slot_file_name.clone()).unwrap(),
+                        file_name: FixedString::new(slot_file_name.clone()).unwrap(),
                         metadata: FileMetadata {
-                            extension: FixedString::new("bin".to_string()).unwrap(),
+                            extension: FixedString::new("bin").unwrap(),
                             extension_type: ExtensionType::default(),
                             timestamp: j2000_timestamp(),
                             version: Version {
@@ -492,13 +493,13 @@ pub async fn upload_program(
                                 beta: 0,
                             },
                         },
-                        vendor: Some(FileVendor::User),
-                        data: u32::to_le_bytes(0xB2DF).to_vec(),
-                        target: None,
-                        load_addr: 0x07A00000,
+                        vendor: FileVendor::User,
+                        data: &u32::to_le_bytes(0xB2DF),
+                        target: FileTransferTarget::Qspi,
+                        load_address: 0x07A00000,
                         linked_file: Some(LinkedFile {
-                            filename: FixedString::new(base_file_name).unwrap(),
-                            vendor: Some(FileVendor::User),
+                            file_name: FixedString::new(base_file_name).unwrap(),
+                            vendor: FileVendor::User,
                         }),
                         after_upload: match after {
                             AfterUpload::None => FileExitAction::DoNothing,
@@ -513,7 +514,7 @@ pub async fn upload_program(
     }
 
     if after == AfterUpload::Run {
-        println!("     \x1b[1;92mRunning\x1b[0m `{}`", slot_file_name);
+        eprintln!("     \x1b[1;92mRunning\x1b[0m `{slot_file_name}`");
     }
 
     Ok(())
@@ -537,26 +538,23 @@ async fn brain_file_metadata(
     connection: &mut SerialConnection,
     file_name: FixedString<23>,
     vendor: FileVendor,
-) -> Result<Option<GetFileMetadataReplyPayload>, SerialError> {
+) -> Result<Option<FileMetadataReplyPayload>, SerialError> {
     let reply = connection
-        .packet_handshake::<GetFileMetadataReplyPacket>(
+        .handshake::<FileMetadataReplyPacket>(
             Duration::from_millis(1000),
             2,
-            GetFileMetadataPacket::new(GetFileMetadataPayload {
+            FileMetadataPacket::new(FileMetadataPayload {
                 vendor,
-                option: 0,
+                reserved: 0,
                 file_name,
             }),
         )
         .await?;
-    match reply.ack {
-        Cdc2Ack::NackProgramFile => Ok(None),
-        Cdc2Ack::Ack => Ok(Some(if let Some(data) = reply.try_into_inner()? {
-            data
-        } else {
-            return Ok(None);
-        })),
-        nack => Err(SerialError::Nack(nack)),
+
+    match reply.payload {
+        Ok(payload) => Ok(payload),
+        Err(Cdc2Ack::NackProgramFile) => Ok(None),
+        Err(nack) => Err(SerialError::Nack(nack)),
     }
 }
 
@@ -584,7 +582,7 @@ fn gzip_compress(data: &mut Vec<u8>) {
 }
 
 pub async fn upload(
-    path: &Utf8Path,
+    path: &Path,
     UploadOpts {
         file,
         slot,
@@ -599,39 +597,49 @@ pub async fn upload(
     after: AfterUpload,
 ) -> miette::Result<SerialConnection> {
     // Try to open a serialport in the background while we build.
-    let connection_task = spawn(open_connection());
+    let (mut connection, (artifact, package_id)) = tokio::try_join!(
+        async {
+            let mut connection = open_connection().await?;
 
-    // Get the build artifact we'll be uploading with.
-    //
-    // The user either directly passed an file through the `--file` argument, or they didn't and we need to run
-    // `cargo build`.
-    let (artifact, package_id) = if let Some(file) = file {
-        if file.extension() == Some("bin") {
-            (file, None)
-        } else {
-            // If a BIN file wasn't provided, we'll attempt to objcopy it as if it were an ELF.
-            let binary = objcopy(
-                &tokio::fs::read(&file)
-                    .await
-                    .map_err(|e| CliError::IoError(e))?,
-            )?;
-            let binary_path = file.with_extension("bin");
+            // Switch the radio to the download channel if the controller is wireless.
+            switch_to_download_channel(&mut connection).await?;
 
-            // Write the binary to a file.
-            tokio::fs::write(&binary_path, binary)
-                .await
-                .map_err(|e| CliError::IoError(e))?;
-            println!("     \x1b[1;92mObjcopy\x1b[0m {}", binary_path);
+            Ok::<SerialConnection, CliError>(connection)
+        },
+        async {
+            // Get the build artifact we'll be uploading with.
+            //
+            // The user either directly passed an file through the `--file` argument, or they didn't and we need to run
+            // `cargo build`.
+            Ok(if let Some(file) = file {
+                if file.extension() == Some(OsStr::new("bin")) {
+                    (file, None)
+                } else {
+                    // If a BIN file wasn't provided, we'll attempt to objcopy it as if it were an ELF.
+                    let binary = objcopy(
+                        &tokio::fs::read(&file)
+                            .await
+                            .map_err(|e| CliError::IoError(e))?,
+                    )?;
+                    let binary_path = file.with_extension("bin");
 
-            (binary_path, None)
+                    // Write the binary to a file.
+                    tokio::fs::write(&binary_path, binary)
+                        .await
+                        .map_err(|e| CliError::IoError(e))?;
+                    eprintln!("     \x1b[1;92mObjcopy\x1b[0m {}", binary_path.display());
+
+                    (binary_path, None)
+                }
+            } else {
+                // Run cargo build, then objcopy.
+                build(path, cargo_opts)
+                    .await?
+                    .map(|output| (output.bin_artifact, Some(output.package_id)))
+                    .ok_or(CliError::NoArtifact)?
+            })
         }
-    } else {
-        // Run cargo build, then objcopy.
-        build(path, cargo_opts)
-            .await?
-            .map(|output| (output.bin_artifact, Some(output.package_id)))
-            .ok_or(CliError::NoArtifact)?
-    };
+    )?;
 
     // We'll use `cargo-metadata` to parse the output of `cargo metadata` and find valid `Cargo.toml`
     // files in the workspace directory.
@@ -640,31 +648,17 @@ pub async fn upload(
 
     // Find which package we're being built from, if we're being built from a package at all.
     let package = cargo_metadata.and_then(|metadata| {
-        metadata
-            .packages
-            .iter()
-            .find(|p| {
-                if let Some(package_id) = package_id.as_ref() {
-                    &p.id == package_id
-                } else {
-                    false
-                }
-            })
+        package_id
+            .as_ref()
+            .and_then(|id| metadata.packages.iter().find(|p| &p.id == id))
+            .or_else(|| metadata.packages.first())
             .cloned()
-            .or(metadata.packages.first().cloned())
     });
 
     // Uploading has the option to use the `package.metadata.v5` table for default configuration options.
     // Attempt to serialize `package.metadata.v5` into a [`Metadata`] struct. This will just Default::default to
     // all `None`s if it can't find a specific field, or error if the field is malformed.
-    let metadata = if let Some(ref package) = package {
-        Some(Metadata::new(package)?)
-    } else {
-        None
-    };
-
-    // Wait for the serial port to finish opening.
-    let mut connection = connection_task.await.unwrap()?;
+    let metadata = package.as_ref().map(Metadata::new).transpose()?;
 
     // The program's slot number is absolutely required for uploading. If the slot argument isn't directly provided:
     //
@@ -691,9 +685,6 @@ pub async fn upload(
     if !(1..=8).contains(&slot) {
         Err(CliError::SlotOutOfRange)?;
     }
-
-    // Switch the radio to the download channel if the controller is wireless.
-    switch_radio_channel(&mut connection, RadioChannel::Download).await?;
 
     // Pass information to the upload routine.
     upload_program(

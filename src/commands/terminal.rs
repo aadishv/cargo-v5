@@ -3,11 +3,11 @@ use std::time::Duration;
 use flexi_logger::{LogSpecification, LoggerHandle};
 use log::info;
 use tokio::{
-    io::{stdin, stdout, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, stdin, stdout},
     select,
     time::sleep,
 };
-use vex_v5_serial::connection::{serial::SerialConnection, Connection};
+use vex_v5_serial::{Connection, serial::SerialConnection};
 
 pub async fn terminal(connection: &mut SerialConnection, logger: &mut LoggerHandle) -> ! {
     info!("Started terminal.");
@@ -15,10 +15,10 @@ pub async fn terminal(connection: &mut SerialConnection, logger: &mut LoggerHand
     logger.push_temp_spec(LogSpecification::off());
 
     let mut stdin = stdin();
+    let mut program_output = [0; 2048];
+    let mut program_input = [0; 4096];
 
     loop {
-        let mut program_output = [0; 1024];
-        let mut program_input = [0; 1024];
         select! {
             read = connection.read_user(&mut program_output) => {
                 if let Ok(size) = read {
