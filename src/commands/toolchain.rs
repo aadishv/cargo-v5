@@ -11,7 +11,11 @@ use crate::{
 
 #[derive(Debug, clap::Subcommand)]
 pub enum ToolchainCmd {
-    Install,
+    Install {
+        /// Skip the interactive confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 impl ToolchainCmd {
@@ -22,7 +26,7 @@ impl ToolchainCmd {
         let settings = Settings::load(metadata.as_ref(), None)?;
 
         match self {
-            Self::Install => {
+            Self::Install { yes } => {
                 let Some(settings) = settings else {
                     return Err(CliError::NoCargoProject);
                 };
@@ -30,12 +34,16 @@ impl ToolchainCmd {
                     return Err(CliError::NoToolchainConfigured);
                 };
 
-                Self::install(&client, &cfg).await
+                Self::install(&client, &cfg, yes).await
             }
         }
     }
 
-    pub async fn install(client: &ToolchainClient, cfg: &ToolchainCfg) -> Result<(), CliError> {
+    pub async fn install(
+        client: &ToolchainClient,
+        cfg: &ToolchainCfg,
+        yes: bool,
+    ) -> Result<(), CliError> {
         let ty = cfg.ty;
         let ToolchainType::LLVM = ty;
 
@@ -52,7 +60,9 @@ impl ToolchainCmd {
 
         let release = client.get_release(version).await?;
 
-        confirm_install(version, false).await?;
+        if !yes {
+            confirm_install(version, false).await?;
+        }
 
         let token = ctrl_c_cancel();
         install_with_progress_bar(client, &release, token.clone()).await?;
